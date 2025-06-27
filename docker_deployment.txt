@@ -1,0 +1,781 @@
+# docker-compose.yml - Полная конфигурация для развертывания системы
+version: '3.8'
+
+services:
+  # База данных PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: telegram_analysis_db
+    environment:
+      POSTGRES_DB: telegram_analysis
+      POSTGRES_USER: telegram_user
+      POSTGRES_PASSWORD: secure_password_123
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=ru_RU.UTF-8 --lc-ctype=ru_RU.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - telegram_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telegram_user -d telegram_analysis"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis для кеширования и очередей
+  redis:
+    image: redis:7-alpine
+    container_name: telegram_analysis_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - telegram_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Backend API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: telegram_analysis_api
+    environment:
+      - DATABASE_URL=postgresql://telegram_user:secure_password_123@postgres:5432/telegram_analysis
+      - REDIS_URL=redis://redis:6379
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - JWT_SECRET=${JWT_SECRET}
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - telegram_sessions:/app/sessions
+    networks:
+      - telegram_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Сервис сбора данных из Telegram
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.collector
+    container_name: telegram_data_collector
+    environment:
+      - DATABASE_URL=postgresql://telegram_user:secure_password_123@postgres:5432/telegram_analysis
+      - REDIS_URL=redis://redis:6379
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - ENVIRONMENT=production
+      - COLLECTOR_BATCH_SIZE=100
+      - COLLECTOR_RATE_LIMIT=1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - telegram_sessions:/app/sessions
+    networks:
+      - telegram_network
+    restart: unless-stopped
+
+  # Сервис анализа данных
+  analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.analyzer
+    container_name: telegram_analyzer
+    environment:
+      - DATABASE_URL=postgresql://telegram_user:secure_password_123@postgres:5432/telegram_analysis
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=production
+      - ANALYSIS_WORKERS=4
+      - SEMANTIC_MODEL=all-MiniLM-L6-v2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models  # Для ML моделей
+    networks:
+      - telegram_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # Сервис мониторинга
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.monitor
+    container_name: telegram_monitor
+    environment:
+      - DATABASE_URL=postgresql://telegram_user:secure_password_123@postgres:5432/telegram_analysis
+      - REDIS_URL=redis://redis:6379
+      - SMTP_SERVER=${SMTP_SERVER}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - ALERT_EMAIL=${ALERT_EMAIL}
+      - ENVIRONMENT=production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - telegram_network
+    restart: unless-stopped
+
+  # Frontend приложение
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: telegram_analysis_frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_ENVIRONMENT=production
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    networks:
+      - telegram_network
+    restart: unless-stopped
+
+  # Nginx для reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: telegram_analysis_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - telegram_network
+    restart: unless-stopped
+
+  # Grafana для мониторинга
+  grafana:
+    image: grafana/grafana:latest
+    container_name: telegram_analysis_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel,grafana-worldmap-panel
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - telegram_network
+    restart: unless-stopped
+
+  # Prometheus для сбора метрик
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: telegram_analysis_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    networks:
+      - telegram_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  telegram_sessions:
+    driver: local
+  grafana_data:
+    driver: local
+  prometheus_data:
+    driver: local
+
+networks:
+  telegram_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+---
+
+# Dockerfile.api - Dockerfile для API сервиса
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование requirements
+COPY requirements.txt .
+
+# Установка Python зависимостей
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копирование кода приложения
+COPY . .
+
+# Создание необходимых директорий
+RUN mkdir -p logs sessions
+
+# Создание пользователя
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Порт приложения
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Команда запуска
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+
+---
+
+# Dockerfile.collector - Dockerfile для сборщика данных
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование requirements
+COPY requirements.collector.txt .
+
+# Установка Python зависимостей
+RUN pip install --no-cache-dir -r requirements.collector.txt
+
+# Копирование кода
+COPY telegram_collector.py .
+COPY database.py .
+COPY config.py .
+
+# Создание директорий
+RUN mkdir -p logs sessions
+
+# Пользователь
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Команда запуска
+CMD ["python", "-m", "telegram_collector"]
+
+---
+
+# Dockerfile.analyzer - Dockerfile для анализатора
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    postgresql-client \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование requirements
+COPY requirements.analyzer.txt .
+
+# Установка Python зависимостей включая ML библиотеки
+RUN pip install --no-cache-dir -r requirements.analyzer.txt
+
+# Скачивание spaCy моделей
+RUN python -m spacy download ru_core_news_sm
+RUN python -m spacy download en_core_web_sm
+
+# Копирование кода
+COPY analysis_engine.py .
+COPY database.py .
+COPY config.py .
+
+# Создание директорий
+RUN mkdir -p logs models
+
+# Пользователь
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Команда запуска
+CMD ["python", "-m", "analysis_engine"]
+
+---
+
+# Dockerfile.monitor - Dockerfile для мониторинга
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование requirements
+COPY requirements.monitor.txt .
+
+# Установка зависимостей
+RUN pip install --no-cache-dir -r requirements.monitor.txt
+
+# Копирование кода
+COPY visualization_monitoring.py .
+COPY database.py .
+COPY config.py .
+
+# Создание директорий
+RUN mkdir -p logs
+
+# Пользователь
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Команда запуска
+CMD ["python", "-m", "visualization_monitoring"]
+
+---
+
+# nginx/nginx.conf - Конфигурация Nginx
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Логирование
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+    error_log /var/log/nginx/error.log warn;
+
+    # Gzip сжатие
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/json
+        application/javascript
+        application/xml+rss
+        application/atom+xml
+        image/svg+xml;
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=login:10m rate=1r/s;
+
+    # Upstream для API
+    upstream api_backend {
+        least_conn;
+        server api:8000 max_fails=3 fail_timeout=30s;
+    }
+
+    # HTTPS редирект
+    server {
+        listen 80;
+        server_name localhost;
+        return 301 https://$server_name$request_uri;
+    }
+
+    # Основной сервер
+    server {
+        listen 443 ssl http2;
+        server_name localhost;
+
+        # SSL конфигурация
+        ssl_certificate /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+        ssl_session_cache shared:SSL:1m;
+        ssl_session_timeout 5m;
+
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;
+        add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+
+        # Frontend
+        location / {
+            proxy_pass http://frontend:80;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # API endpoints
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            
+            proxy_pass http://api_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # Timeouts
+            proxy_connect_timeout 30s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 60s;
+            
+            # Buffer settings
+            proxy_buffering on;
+            proxy_buffer_size 4k;
+            proxy_buffers 8 4k;
+        }
+
+        # WebSocket для real-time updates
+        location /ws/ {
+            proxy_pass http://api_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 86400;
+        }
+
+        # Static files
+        location /static/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            alias /app/static/;
+        }
+
+        # Grafana
+        location /grafana/ {
+            proxy_pass http://grafana:3000/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
+
+---
+
+# prometheus/prometheus.yml - Конфигурация Prometheus
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "rules/*.yml"
+
+scrape_configs:
+  - job_name: 'telegram-api'
+    static_configs:
+      - targets: ['api:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  - job_name: 'postgres-exporter'
+    static_configs:
+      - targets: ['postgres:9187']
+
+  - job_name: 'redis-exporter'
+    static_configs:
+      - targets: ['redis:9121']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+---
+
+# redis/redis.conf - Конфигурация Redis
+# Основные настройки
+bind 0.0.0.0
+port 6379
+timeout 300
+tcp-keepalive 60
+
+# Память
+maxmemory 2gb
+maxmemory-policy allkeys-lru
+
+# Персистентность
+save 900 1
+save 300 10
+save 60 10000
+
+# Логирование
+loglevel notice
+logfile ""
+
+# Security
+requirepass your_redis_password
+
+# Производительность
+databases 16
+tcp-backlog 511
+
+---
+
+# sql/init.sql - SQL для инициализации БД
+-- Создание расширений
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+
+-- Создание индексов для полнотекстового поиска
+CREATE INDEX IF NOT EXISTS idx_posts_text_gin ON posts USING gin(to_tsvector('russian', text));
+CREATE INDEX IF NOT EXISTS idx_channels_name_gin ON channels USING gin(to_tsvector('russian', name));
+
+-- Создание функции для обновления last_updated
+CREATE OR REPLACE FUNCTION update_last_updated_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.last_updated = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Создание триггеров
+CREATE TRIGGER update_channels_last_updated 
+    BEFORE UPDATE ON channels 
+    FOR EACH ROW 
+    EXECUTE FUNCTION update_last_updated_column();
+
+-- Создание пользователя для мониторинга
+CREATE USER monitoring_user WITH PASSWORD 'monitoring_password';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO monitoring_user;
+
+-- Начальные данные
+INSERT INTO channels (name, username, description, theme) VALUES
+('Демо канал 1', '@demo1', 'Демонстрационный канал для тестирования', 'Технологии'),
+('Демо канал 2', '@demo2', 'Еще один демо канал', 'Новости')
+ON CONFLICT (username) DO NOTHING;
+
+---
+
+# .env.example - Пример файла переменных окружения
+# Telegram API
+TELEGRAM_API_ID=your_api_id
+TELEGRAM_API_HASH=your_api_hash
+
+# Database
+DATABASE_URL=postgresql://telegram_user:secure_password_123@localhost:5432/telegram_analysis
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# JWT
+JWT_SECRET=your_very_secure_jwt_secret_key_here
+
+# Email настройки для алертов
+SMTP_SERVER=smtp.gmail.com
+SMTP_USERNAME=your_email@gmail.com
+SMTP_PASSWORD=your_app_password
+ALERT_EMAIL=admin@yourcompany.com
+
+# Grafana
+GRAFANA_PASSWORD=secure_grafana_password
+
+# Окружение
+ENVIRONMENT=production
+
+---
+
+# requirements.txt - Основные зависимости для API
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9
+redis==5.0.1
+aioredis==2.0.1
+pydantic==2.5.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+httpx==0.25.2
+prometheus-client==0.19.0
+
+---
+
+# requirements.collector.txt - Зависимости для сборщика
+telethon==1.32.1
+pyrogram==2.0.106
+aiofiles==23.2.0
+Pillow==10.1.0
+imagehash==4.3.1
+asyncpg==0.29.0
+redis==5.0.1
+
+---
+
+# requirements.analyzer.txt - Зависимости для анализатора
+scikit-learn==1.3.2
+pandas==2.1.4
+numpy==1.25.2
+scipy==1.11.4
+spacy==3.7.2
+sentence-transformers==2.2.2
+networkx==3.2.1
+plotly==5.17.0
+
+---
+
+# requirements.monitor.txt - Зависимости для мониторинга
+plotly==5.17.0
+aioredis==2.0.1
+aiosmtplib==2.0.2
+
+---
+
+# Makefile - Автоматизация развертывания
+.PHONY: build up down logs shell migrate test clean
+
+# Сборка всех сервисов
+build:
+	docker-compose build
+
+# Запуск всех сервисов
+up:
+	docker-compose up -d
+
+# Остановка всех сервисов
+down:
+	docker-compose down
+
+# Просмотр логов
+logs:
+	docker-compose logs -f
+
+# Подключение к API контейнеру
+shell:
+	docker-compose exec api bash
+
+# Выполнение миграций
+migrate:
+	docker-compose exec api alembic upgrade head
+
+# Запуск тестов
+test:
+	docker-compose exec api pytest
+
+# Очистка системы
+clean:
+	docker-compose down -v
+	docker system prune -af
+
+# Бэкап базы данных
+backup:
+	docker-compose exec postgres pg_dump -U telegram_user telegram_analysis > backup_$(shell date +%Y%m%d_%H%M%S).sql
+
+# Восстановление из бэкапа
+restore:
+	@read -p "Enter backup file path: " backup_file; \
+	docker-compose exec -T postgres psql -U telegram_user telegram_analysis < $$backup_file
+
+# Мониторинг статуса сервисов
+status:
+	docker-compose ps
+
+# Просмотр использования ресурсов
+stats:
+	docker stats
+
+# Обновление системы
+update:
+	git pull
+	docker-compose pull
+	docker-compose build
+	docker-compose up -d
+
+# Перезапуск конкретного сервиса
+restart-api:
+	docker-compose restart api
+
+restart-collector:
+	docker-compose restart collector
+
+restart-analyzer:
+	docker-compose restart analyzer
