@@ -8,6 +8,7 @@ import asyncio
 import uvicorn
 from datetime import datetime, timedelta
 import logging
+import os
 
 # Модели данных
 class Channel(BaseModel):
@@ -223,7 +224,11 @@ class TemporalAnalyzer:
         return synchronized
 
 # Инициализация сервисов
-telegram_collector = TelegramDataCollector("fake_api_id", "fake_api_hash")
+# Читаем учетные данные из переменных окружения
+telegram_collector = TelegramDataCollector(
+    os.getenv("TELEGRAM_API_ID", ""),
+    os.getenv("TELEGRAM_API_HASH", "")
+)
 content_analyzer = ContentAnalyzer()
 network_analyzer = NetworkAnalyzer()
 temporal_analyzer = TemporalAnalyzer()
