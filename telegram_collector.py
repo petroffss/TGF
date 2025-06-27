@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import aiofiles
 import aiohttp
+import os
 from PIL import Image
 import imagehash
 
@@ -463,8 +464,8 @@ class TelegramAnalyticsCollector:
 async def main():
     # Конфигурация
     config = TelegramConfig(
-        api_id="YOUR_API_ID",
-        api_hash="YOUR_API_HASH",
+        api_id=os.getenv("TELEGRAM_API_ID", ""),
+        api_hash=os.getenv("TELEGRAM_API_HASH", ""),
         session_name="analyzer_session"
     )
     

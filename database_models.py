@@ -5,9 +5,13 @@ from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from datetime import datetime
 import uuid
+import os
 
 # Настройки подключения к базе данных
-DATABASE_URL = "postgresql://username:password@localhost/telegram_analysis"
+# Используем переменную окружения DATABASE_URL.
+# Значение по умолчанию подходит для локальной SQLite базы,
+# чтобы проект можно было запустить без дополнительной настройки.
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
 
 # Создание движка и сессии
 engine = create_engine(DATABASE_URL)
